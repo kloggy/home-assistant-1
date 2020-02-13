@@ -21,7 +21,13 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_ON,
 )
-from homeassistant.core import Context, CoreState, HomeAssistant, callback
+from homeassistant.core import (
+    Context,
+    CoreState,
+    HomeAssistant,
+    callback,
+    split_entity_id,
+)
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import condition, extract_domain_configs
 import homeassistant.helpers.config_validation as cv
@@ -330,6 +336,10 @@ class AutomationEntity(ToggleEntity, RestoreEntity):
         """Startup with initial state or previous state."""
         await super().async_added_to_hass()
 
+        self.action_script.set_logger(
+            logging.getLogger(f"{__name__}.{split_entity_id(self.entity_id)[1]}")
+        )
+
         state = await self.async_get_last_state()
         if state:
             enable_automation = state.state == STATE_ON
@@ -397,17 +407,12 @@ class AutomationEntity(ToggleEntity, RestoreEntity):
         _LOGGER.info("Executing %s", self._name)
 
         try:
-            await self.action_script.async_run(
-                variables,
-                trigger_context,
-                _LOGGER,
-                f"Error while executing automation {self.entity_id}",
-            )
+            await self.action_script.async_run(variables, trigger_context)
         except Exception:  # pylint: disable=broad-except
             pass
 
         self._last_triggered = self.action_script.last_triggered
-        await self.async_update_ha_state()
+        self.async_write_ha_state()
 
     async def async_will_remove_from_hass(self):
         """Remove listeners when removing automation from Home Assistant."""

@@ -16,7 +16,7 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_ON,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, callback, split_entity_id
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.config_validation import make_entity_service_schema
 from homeassistant.helpers.entity import ToggleEntity
@@ -232,7 +232,7 @@ class ScriptEntity(ToggleEntity):
         self.object_id = object_id
         self.entity_id = ENTITY_ID_FORMAT.format(object_id)
         self.script = Script(
-            hass, sequence, name, self.async_update_ha_state, SCRIPT_PARALLEL_ERROR
+            hass, sequence, name, self.async_write_ha_state, SCRIPT_PARALLEL_ERROR
         )
 
     @property
@@ -270,16 +270,17 @@ class ScriptEntity(ToggleEntity):
             {ATTR_NAME: self.script.name, ATTR_ENTITY_ID: self.entity_id},
             context=context,
         )
-        await self.script.async_run(
-            kwargs.get(ATTR_VARIABLES),
-            context,
-            _LOGGER,
-            f"Error executing script {self.entity_id}",
-        )
+        await self.script.async_run(kwargs.get(ATTR_VARIABLES), context)
 
     async def async_turn_off(self, **kwargs):
         """Turn script off."""
         self.script.async_stop()
+
+    async def async_added_to_hass(self) -> None:
+        """Run when entity about to be added to hass."""
+        self.script.set_logger(
+            logging.getLogger(f"{__name__}.{split_entity_id(self.entity_id)[1]}")
+        )
 
     async def async_will_remove_from_hass(self):
         """Stop script and remove service when it will be removed from Home Assistant."""

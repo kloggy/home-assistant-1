@@ -1,7 +1,7 @@
 """The tests for the Script component."""
 # pylint: disable=protected-access
 from datetime import timedelta
-import functools as ft
+import logging
 from unittest import mock
 
 import asynctest
@@ -103,14 +103,9 @@ async def test_calling_service(hass):
 
     hass.services.async_register("test", "script", record_call)
 
-    hass.async_add_job(
-        ft.partial(
-            script.call_from_config,
-            hass,
-            {"service": "test.script", "data": {"hello": "world"}},
-            context=context,
-        )
-    )
+    await script.Script(
+        hass, cv.SCRIPT_SCHEMA({"service": "test.script", "data": {"hello": "world"}})
+    ).async_run(context=context)
 
     await hass.async_block_till_done()
 
@@ -131,10 +126,8 @@ async def test_activating_scene(hass):
 
     hass.services.async_register(scene.DOMAIN, SERVICE_TURN_ON, record_call)
 
-    hass.async_add_job(
-        ft.partial(
-            script.call_from_config, hass, {"scene": "scene.hello"}, context=context
-        )
+    await script.Script(hass, cv.SCRIPT_SCHEMA({"scene": "scene.hello"})).async_run(
+        context=context
     )
 
     await hass.async_block_till_done()
@@ -156,10 +149,9 @@ async def test_calling_service_template(hass):
 
     hass.services.async_register("test", "script", record_call)
 
-    hass.async_add_job(
-        ft.partial(
-            script.call_from_config,
-            hass,
+    await script.Script(
+        hass,
+        cv.SCRIPT_SCHEMA(
             {
                 "service_template": """
                 {% if True %}
@@ -177,10 +169,8 @@ async def test_calling_service_template(hass):
                 """
                 },
             },
-            {"is_world": "yes"},
-            context=context,
-        )
-    )
+        ),
+    ).async_run({"is_world": "yes"}, context=context)
 
     await hass.async_block_till_done()
 
@@ -272,7 +262,7 @@ async def test_delay_template(hass):
     assert len(events) == 2
 
 
-async def test_delay_invalid_template(hass):
+async def test_delay_invalid_template(hass, caplog):
     """Test the delay as a template that fails."""
     event = "test_event"
     events = []
@@ -294,12 +284,14 @@ async def test_delay_invalid_template(hass):
                 {"event": event},
             ]
         ),
+        logger=logging.getLogger("TEST"),
     )
 
-    with mock.patch.object(script, "_LOGGER") as mock_logger:
-        await script_obj.async_run()
-        await hass.async_block_till_done()
-        assert mock_logger.error.called
+    await script_obj.async_run()
+    await hass.async_block_till_done()
+    assert any(
+        rec.levelname == "ERROR" and rec.name == "TEST" for rec in caplog.records
+    )
 
     assert not script_obj.is_running
     assert len(events) == 1
@@ -345,7 +337,7 @@ async def test_delay_complex_template(hass):
     assert len(events) == 2
 
 
-async def test_delay_complex_invalid_template(hass):
+async def test_delay_complex_invalid_template(hass, caplog):
     """Test the delay with a complex template that fails."""
     event = "test_event"
     events = []
@@ -367,12 +359,14 @@ async def test_delay_complex_invalid_template(hass):
                 {"event": event},
             ]
         ),
+        logger=logging.getLogger("TEST"),
     )
 
-    with mock.patch.object(script, "_LOGGER") as mock_logger:
-        await script_obj.async_run()
-        await hass.async_block_till_done()
-        assert mock_logger.error.called
+    await script_obj.async_run()
+    await hass.async_block_till_done()
+    assert any(
+        rec.levelname == "ERROR" and rec.name == "TEST" for rec in caplog.records
+    )
 
     assert not script_obj.is_running
     assert len(events) == 1
@@ -413,12 +407,69 @@ async def test_cancel_while_delay(hass):
     assert len(events) == 0
 
 
-async def test_run_while_suspended(hass):
-    """Test running when already running."""
+async def test_run_twice_allow_immediate(hass):
+    """Test running immediately when already running with allow mode."""
+    event1 = "test_event_1"
+    event2 = "test_event_2"
+    events = []
+
+    @callback
+    def record_event(event):
+        """Add recorded event to set."""
+        events.append(event)
+
+    hass.bus.async_listen(event1, record_event)
+    hass.bus.async_listen(event2, record_event)
+
+    script_obj = script.Script(
+        hass,
+        cv.SCRIPT_SCHEMA(
+            [{"event": event1}, {"delay": {"seconds": 10}}, {"event": event2}]
+        ),
+        mode="allow",
+    )
+
+    context1 = Context()
+    time1 = dt_util.now()
+    with mock.patch("homeassistant.helpers.script.utcnow", return_value=time1):
+        await script_obj.async_run(context=context1)
+        await hass.async_block_till_done()
+
+    assert script_obj.is_running
+    assert script_obj.last_triggered == time1
+    assert len(events) == 1
+    assert events[-1].event_type is event1
+    assert events[-1].context is context1
+
+    context2 = Context()
+    time2 = dt_util.now()
+    with mock.patch("homeassistant.helpers.script.utcnow", return_value=time2):
+        await script_obj.async_run(context=context2)
+        await hass.async_block_till_done()
+
+    assert script_obj.is_running
+    assert script_obj.last_triggered == time2
+    assert len(events) == 2
+    assert events[-1].event_type is event1
+    assert events[-1].context is context2
+
+    time3 = dt_util.utcnow() + timedelta(seconds=10)
+    async_fire_time_changed(hass, time3)
+    await hass.async_block_till_done()
+
+    assert not script_obj.is_running
+    assert script_obj.last_triggered == time2
+    assert len(events) == 4
+    assert events[-2].event_type is event2
+    assert events[-2].context is context1
+    assert events[-1].event_type is event2
+    assert events[-1].context is context2
+
+
+async def test_run_twice_error(hass, caplog):
+    """Test running when already running with error mode."""
     event = "test_event"
     events = []
-    context = Context()
-    delay_alias = "delay step"
 
     @callback
     def record_event(event):
@@ -430,37 +481,38 @@ async def test_run_while_suspended(hass):
     script_obj = script.Script(
         hass,
         cv.SCRIPT_SCHEMA(
-            [
-                {"event": event},
-                {"delay": {"seconds": 5}, "alias": delay_alias},
-                {"event": event},
-            ]
+            [{"event": event}, {"delay": {"seconds": 10}}, {"event": event}]
         ),
         mode="error",
+        logger=logging.getLogger("TEST"),
     )
 
-    await script_obj.async_run(context=context)
-    await hass.async_block_till_done()
+    time1 = dt_util.now()
+    with mock.patch("homeassistant.helpers.script.utcnow", return_value=time1):
+        await script_obj.async_run()
+        await hass.async_block_till_done()
 
     assert script_obj.is_running
-    assert script_obj.can_cancel
-    assert script_obj.last_action == delay_alias
+    assert script_obj.last_triggered == time1
     assert len(events) == 1
 
     with pytest.raises(exceptions.HomeAssistantError):
-        await script_obj.async_run(context=context)
+        await script_obj.async_run()
+        await hass.async_block_till_done()
+    assert any(
+        rec.levelname == "ERROR" and rec.name == "TEST" for rec in caplog.records
+    )
 
     assert script_obj.is_running
     assert len(events) == 1
 
-    future = dt_util.utcnow() + timedelta(seconds=5)
-    async_fire_time_changed(hass, future)
+    time2 = dt_util.utcnow() + timedelta(seconds=10)
+    async_fire_time_changed(hass, time2)
     await hass.async_block_till_done()
 
     assert not script_obj.is_running
+    assert script_obj.last_triggered == time1
     assert len(events) == 2
-    assert events[0].context is context
-    assert events[1].context is context
 
 
 async def test_wait_template(hass):
@@ -930,27 +982,6 @@ async def test_all_conditions_cached(hass):
     await script_obj.async_run()
     await hass.async_block_till_done()
     assert len(script_obj._config_cache) == 2
-
-
-async def test_last_triggered(hass):
-    """Test the last_triggered."""
-    event = "test_event"
-
-    script_obj = script.Script(
-        hass,
-        cv.SCRIPT_SCHEMA(
-            [{"event": event}, {"delay": {"seconds": 5}}, {"event": event}]
-        ),
-    )
-
-    assert script_obj.last_triggered is None
-
-    time = dt_util.utcnow()
-    with mock.patch("homeassistant.helpers.script.utcnow", return_value=time):
-        await script_obj.async_run()
-        await hass.async_block_till_done()
-
-    assert script_obj.last_triggered == time
 
 
 async def test_propagate_error_service_not_found(hass):

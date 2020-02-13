@@ -289,7 +289,12 @@ async def test_action_delay_retrigger_error(hass, calls, caplog):
     assert state is not None
     assert state.attributes.get("last_triggered") == time1
 
-    assert "Error while executing automation" in caplog.text
+    assert any(
+        rec.levelname == "ERROR"
+        and rec.name.startswith("homeassistant.components.automation")
+        and "already running" in rec.message.lower()
+        for rec in caplog.records
+    )
 
 
 async def test_action_delay_retrigger_restart(hass, calls):
