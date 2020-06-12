@@ -212,10 +212,7 @@ async def async_setup(hass, config):
 
         await _async_process_config(hass, conf, component)
 
-    async def turn_on_service(service):
-        """Call a service to turn script on."""
-        var = service.data.get(ATTR_VARIABLES)
-        background = service.data[ATTR_BACKGROUND]
+    async def turn_on_toggle_service(service, legacy_cofunc, non_legacy_meth, **kwargs):
         script_entities = await component.async_extract_from_service(service)
 
         # Legacy scripts will be run as before, so split them out.
@@ -230,23 +227,17 @@ async def async_setup(hass, config):
             if not script_entity.script.is_legacy
         ]
 
-        async def turn_on_legacy(legacy_script_entities):
-            for script_entity in legacy_script_entities:
-                await hass.services.async_call(
-                    DOMAIN, script_entity.object_id, var, context=service.context
-                )
-
         tasks = []
         # Legacy scripts will be run one after the other. Any script that causes an
         # exception will prevent the rest from running.
         if legacy_script_entities:
-            tasks.append(hass.async_create_task(turn_on_legacy(legacy_script_entities)))
+            tasks.append(hass.async_create_task(legacy_cofunc(legacy_script_entities)))
         # All new style scripts will be run concurrently and independently.
         for script_entity in script_entities:
             tasks.append(
                 hass.async_create_task(
-                    script_entity.async_turn_on(
-                        variables=var, context=service.context, background=background
+                    getattr(script_entity, non_legacy_meth)(
+                        context=service.context, **kwargs
                     )
                 )
             )
@@ -274,6 +265,24 @@ async def async_setup(hass, config):
             if first_exception:
                 raise first_exception
 
+    async def turn_on_service(service):
+        """Call a service to turn script on."""
+        variables = service.data.get(ATTR_VARIABLES)
+
+        async def turn_on_legacy(legacy_script_entities):
+            for script_entity in legacy_script_entities:
+                await hass.services.async_call(
+                    DOMAIN, script_entity.object_id, variables, context=service.context
+                )
+
+        await turn_on_toggle_service(
+            service,
+            turn_on_legacy,
+            "async_turn_on",
+            variables=variables,
+            background=service.data[ATTR_BACKGROUND],
+        )
+
     async def turn_off_service(service):
         """Cancel a script."""
         script_entities = await component.async_extract_from_service(service)
@@ -281,27 +290,30 @@ async def async_setup(hass, config):
         if not script_entities:
             return
 
-        done, _ = await asyncio.wait(
-            [script_entity.async_turn_off() for script_entity in script_entities]
-        )
-        # Propagate any exceptions that might have happened.
-        for done_task in done:
-            done_task.result()
-
-    async def toggle_service(service):
-        """Toggle a script."""
-        aws = []
-        for script_entity in await component.async_extract_from_service(service):
-            coro = script_entity.async_toggle(context=service.context)
-            if script_entity.script.is_legacy:
-                aws.append(hass.async_create_task(coro))
-            else:
-                aws.append(coro)
-        if aws:
-            done, _ = await asyncio.wait(aws)
+        tasks = [
+            hass.async_create_task(script_entity.async_turn_off())
+            for script_entity in script_entities
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks)
+        except asyncio.CancelledError:
+            # Cancel any tasks that haven't completed.
+            for task in tasks:
+                task.cancel()
+            raise
+        else:
             # Propagate any exceptions that might have happened.
             for done_task in done:
                 done_task.result()
+
+    async def toggle_service(service):
+        """Toggle a script."""
+
+        async def toggle_legacy(legacy_script_entities):
+            for script_entity in legacy_script_entities:
+                await script_entity.async_toggle(context=service.context)
+
+        await turn_on_toggle_service(service, toggle_legacy, "async_toggle")
 
     hass.services.async_register(
         DOMAIN, SERVICE_RELOAD, reload_service, schema=RELOAD_SERVICE_SCHEMA
